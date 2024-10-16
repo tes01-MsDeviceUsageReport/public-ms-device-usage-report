@@ -1,0 +1,174 @@
+name: (beta)Get-AdminReportSettings
+ 
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_TENANT_NAME: ${{ secrets.AZURE_TENANT_NAME }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      SITE_NAME: ${{ secrets.SITE_NAME }}
+      DOC_LIB: ${{ secrets.DOC_LIB }}
+      
+    steps:
+    - name: Set env
+      shell: bash
+      run: |
+        japanTimeZone="Asia/Tokyo"
+        
+        # 昨日の日付
+        japanYesterday=$(TZ=$japanTimeZone date -d "yesterday" +"%Y-%m-%d")
+        echo "YESTERDAY_DATE=$japanYesterday" >> $GITHUB_ENV
+    
+        # 昨日の年と月
+        japanYesterdayYear=$(TZ=$japanTimeZone date -d "yesterday" +"%Y")
+        japanYesterdayMonth=$(TZ=$japanTimeZone date -d "yesterday" +"%m")
+    
+        # 月が1～3なら、年度は前年（年を-1）
+        if [ "$japanYesterdayMonth" -le 3 ]; then
+          japanSchoolYear=$((japanYesterdayYear - 1))
+        else
+          japanSchoolYear=$japanYesterdayYear
+        fi
+    
+        echo "YESTERDAY_SCHOOL_YEAR=$japanSchoolYear" >> $GITHUB_ENV
+    
+        # フォルダ
+        echo "DIR=M365UsageRecords/M365UsageReports" >> $GITHUB_ENV
+        
+    - name: Install PowerShell
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y powershell
+
+    - name: Microsoft.Graph.Beta.Reportsモジュールのインストール
+      shell: pwsh
+      run: |
+        Install-Module Microsoft.Graph.Beta.Reports -Force -Scope CurrentUser -AllowClobber -Repository PSGallery
+
+    - name: Acquire Access Token (For Get MgReport)
+      id: aat_graph
+      shell: bash
+      run: |
+        federated_token=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r '.value')
+        response=$(curl -s -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
+            -F client_id=$AZURE_CLIENT_ID \
+            -F grant_type=client_credentials \
+            -F scope=https://graph.microsoft.com/.default \
+            -F client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+            -F client_assertion=$federated_token)
+        access_token=$(echo $response | jq -r '.access_token')
+        echo "GRAPH_TOKEN=$access_token" >> $GITHUB_ENV
+
+    - name: Acquire Access Token (For Upload MgReport)
+      id: aat_sharepoint
+      shell: bash
+      run: |
+        federated_token=$(curl -s -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r '.value')
+        response=$(curl -s -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
+            -F client_id=$AZURE_CLIENT_ID \
+            -F grant_type=client_credentials \
+            -F scope=https://$AZURE_TENANT_NAME.sharepoint.com/.default \
+            -F client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer \
+            -F client_assertion=$federated_token)
+        access_token=$(echo $response | jq -r '.access_token')
+        echo "SHAREPOINT_TOKEN=$access_token" >> $GITHUB_ENV
+        
+    - name: Get adminReportSettings(MgReport)
+      shell: pwsh
+      run: |
+        Import-Module Microsoft.Graph.Beta.Reports
+        $secureToken = ConvertTo-SecureString $env:GRAPH_TOKEN -AsPlainText -Force
+        Connect-MgGraph -AccessToken $secureToken
+        
+        # 日付設定
+        $dateStr = $env:YESTERDAY_DATE
+        $date = ([Datetime]$dateStr)
+        $school_year = $env:YESTERDAY_SCHOOL_YEAR
+        
+        # 出力ディレクトリの作成
+        $outputDir = "$env:DIR/AdminReportSettings/$school_year"
+        if (-not (Test-Path -Path $outputDir)) {
+            New-Item -ItemType Directory -Path $outputDir
+        }
+        
+        # Get-MgBetaAdminReportSettingの実行
+        $outputPath = "$outputDir/${dateStr}_result_Get-MgBetaAdminReportSetting.json"
+        $reportSettings = Get-MgBetaAdminReportSetting
+        
+        # JSON形式に変換してファイルに出力
+        $reportSettings | ConvertTo-Json -Depth 10 | Out-File -FilePath $outputPath
+
+        # ファイルが正しく生成されたか確認
+        if (Test-Path $outputPath) {
+            Write-Host "ファイル '$outputPath' が生成されました。"
+        } else {
+            Write-Host "ファイル '$outputPath' が見つかりません。"
+        }
+        Disconnect-MgGraph
+
+    - name: Upload MgReport to SharePoint
+      shell: pwsh
+      run: |
+        $dateStr = $env:YESTERDAY_DATE
+        $school_year = $env:YESTERDAY_SCHOOL_YEAR
+
+        # フォルダ名とそれに対応するファイルパス
+        $foldersAndFiles = @(
+          @{ name = "AdminReportSettings"; file = "${dateStr}_result_Get-MgBetaAdminReportSetting.json" }
+        )
+        
+        # フォルダを作成する関数
+        function Create-FolderRecursively {
+            param (
+                [string]$folderPath
+            )
+            $parts = $folderPath.TrimStart("/").Split('/')
+            $currentPath = "/sites/$env:SITE_NAME/$env:DOC_LIB"
+            
+            foreach ($part in $parts) {
+                $currentPath = "$currentPath/$part"
+                $encodedPath = [uri]::EscapeDataString($currentPath.Trim('/'))
+                $checkUrl = "https://$env:AZURE_TENANT_NAME.sharepoint.com/sites/$env:SITE_NAME/_api/web/GetFolderByServerRelativeUrl('$encodedPath')"
+                $createUrl = "https://$env:AZURE_TENANT_NAME.sharepoint.com/sites/$env:SITE_NAME/_api/web/folders"
+                
+                try {
+                    # フォルダが存在するか確認
+                    Invoke-RestMethod -Uri $checkUrl -Method Get -Headers @{ Authorization = "Bearer $env:SHAREPOINT_TOKEN"; "Accept" = "application/json;odata=verbose" }
+                } catch {
+                    # フォルダが存在しない場合は作成
+                    Write-Host "フォルダ '$currentPath' を作成しています..."
+                    $body = @{ "__metadata" = @{ "type" = "SP.Folder" }; "ServerRelativeUrl" = $currentPath } | ConvertTo-Json
+                    Invoke-RestMethod -Uri $createUrl -Method Post -Headers @{ Authorization = "Bearer $env:SHAREPOINT_TOKEN"; "Accept" = "application/json;odata=verbose"; "Content-Type" = "application/json;odata=verbose" } -Body $body
+                }
+            }
+        }
+
+        # ファイルとフォルダの処理
+        foreach ($item in $foldersAndFiles) {
+            $name = $item.name
+            $filePath = "$env:DIR/$name/$school_year/$($item.file)"
+            $fileName = [System.IO.Path]::GetFileName($filePath)
+            $folder = "/$env:DIR/$name/$school_year"
+
+            # フォルダを1つずつ作成
+            Create-FolderRecursively -folderPath $folder
+
+            $uploadUrl = "https://$env:AZURE_TENANT_NAME.sharepoint.com/sites/$env:SITE_NAME/_api/web/GetFolderByServerRelativeUrl('/sites/$env:SITE_NAME/$env:DOC_LIB$folder')/Files/add(url='$fileName',overwrite=true)"
+      
+            # ファイルの存在を確認してアップロード
+            if (Test-Path $filePath) {
+                $fileContent = [System.IO.File]::ReadAllBytes($filePath)
+                Invoke-RestMethod -Uri $uploadUrl -Method Post -Headers @{ Authorization = "Bearer $env:SHAREPOINT_TOKEN"; "Accept" = "application/json;odata=verbose" } -Body $fileContent -ContentType "application/octet-stream"
+                Write-Host "ファイル '$filePath' をアップロードしました。"
+            } else {
+                Write-Host "ファイル '$filePath' が見つかりません。"
+            }
+        }   
